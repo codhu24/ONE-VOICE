@@ -22,7 +22,15 @@ import httpx
 with contextlib.suppress(ImportError):
     import google.generativeai as genai  # type: ignore
 
-# Try to load Google Cloud Speech-to-Text
+# Try to load AssemblyAI for real-time speech recognition
+try:
+    import assemblyai as aai
+    ASSEMBLYAI_AVAILABLE = True
+except ImportError:
+    ASSEMBLYAI_AVAILABLE = False
+    print("Warning: AssemblyAI not available. Install assemblyai package for real-time speech recognition.")
+
+# Try to load Google Cloud Speech-to-Text (kept for backward compatibility)
 try:
     from google.cloud import speech
     from google.cloud.speech import SpeechAdaptation, PhraseSet, PhraseSetReference
@@ -65,6 +73,11 @@ load_dotenv()  # <-- Add this line
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_TRANSLATE_API_KEY = os.getenv("GOOGLE_TRANSLATE_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")  # Only use if actually set
+ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+
+# Configure AssemblyAI if available
+if ASSEMBLYAI_AVAILABLE and ASSEMBLYAI_API_KEY:
+    aai.settings.api_key = ASSEMBLYAI_API_KEY
 
 # -----------------------------
 # App setup
@@ -889,279 +902,105 @@ VOICE_COMMAND_PHRASES = (
     SIGN_LANGUAGE_PHRASES
 )
 
-GOOGLE_CLOUD_SPEECH_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-GOOGLE_CLOUD_SPEECH_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
-
 @app.websocket("/ws/voice")
 async def websocket_voice(websocket: WebSocket):
     """
-    WebSocket endpoint for streaming voice recognition.
-    Receives audio chunks and returns transcripts using Google Cloud Speech-to-Text.
+    WebSocket endpoint for streaming voice recognition using AssemblyAI.
+    Receives audio chunks and returns transcripts in real-time.
     """
     await websocket.accept()
     
-    if not GOOGLE_CLOUD_SPEECH_AVAILABLE:
+    # Check if AssemblyAI is available
+    if not ASSEMBLYAI_AVAILABLE:
         await websocket.send_json({
             "type": "error",
-            "message": "Google Cloud Speech-to-Text not available. Please install google-cloud-speech."
+            "message": "AssemblyAI not available. Please install assemblyai package."
         })
         await websocket.close()
         return
     
-    # Check for Google Cloud credentials
-    if not GOOGLE_CLOUD_SPEECH_CREDENTIALS and not GOOGLE_CLOUD_SPEECH_PROJECT:
+    # Check for AssemblyAI API key
+    if not ASSEMBLYAI_API_KEY:
         await websocket.send_json({
             "type": "error",
-            "message": "Google Cloud credentials not configured. Set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_CLOUD_PROJECT."
+            "message": "AssemblyAI API key not configured. Set ASSEMBLYAI_API_KEY in .env file."
         })
         await websocket.close()
         return
+    
+    # Store transcriber reference for cleanup
+    transcriber = None
     
     try:
-        # Initialize Google Cloud Speech client
-        client = speech.SpeechClient()
-        
-        # Create multiple phrase sets with different boost values for better accuracy
-        # Navigation commands get highest boost
-        navigation_phrase_set = speech.PhraseSet(
-            phrases=[
-                speech.PhraseSet.Phrase(value=phrase, boost=20.0)
-                for phrase in NAVIGATION_PHRASES
-            ]
+        # Configure AssemblyAI transcriber with word boost for voice commands
+        config = aai.TranscriberConfig(
+            sample_rate=16000,
+            word_boost=VOICE_COMMAND_PHRASES,  # Boost recognition of voice commands
+            boost_param="high",  # High boost for better command recognition
         )
         
-        # Voice control commands get high boost
-        voice_control_phrase_set = speech.PhraseSet(
-            phrases=[
-                speech.PhraseSet.Phrase(value=phrase, boost=18.0)
-                for phrase in VOICE_CONTROL_PHRASES
-            ]
+        # Create the real-time transcriber
+        transcriber = aai.RealtimeTranscriber(
+            on_data=None,  # We'll set this below
+            on_error=None,  # We'll set this below
+            sample_rate=16000,
+            encoding=aai.AudioEncoding.pcm_s16le,
         )
         
-        # Panel-specific commands get medium-high boost
-        hearing_phrase_set = speech.PhraseSet(
-            phrases=[
-                speech.PhraseSet.Phrase(value=phrase, boost=15.0)
-                for phrase in HEARING_PHRASES
-            ]
-        )
-        
-        speech_phrase_set = speech.PhraseSet(
-            phrases=[
-                speech.PhraseSet.Phrase(value=phrase, boost=15.0)
-                for phrase in SPEECH_PHRASES
-            ]
-        )
-        
-        sign_language_phrase_set = speech.PhraseSet(
-            phrases=[
-                speech.PhraseSet.Phrase(value=phrase, boost=15.0)
-                for phrase in SIGN_LANGUAGE_PHRASES
-            ]
-        )
-        
-        # Create speech adaptation with all phrase sets
-        adaptation = speech.SpeechAdaptation(
-            phrase_sets=[
-                navigation_phrase_set,
-                voice_control_phrase_set,
-                hearing_phrase_set,
-                speech_phrase_set,
-                sign_language_phrase_set,
-            ]
-        )
-        
-        # Configure recognition with automatic language detection
-        # Support multiple languages for detection
-        alternative_language_codes = [
-            "en-US", "hi-IN", "es-ES", "fr-FR", "de-DE", 
-            "te-IN", "ta-IN", "bn-IN", "or-IN", "gu-IN"
-        ]
-        
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code="en-US",  # Primary language
-            alternative_language_codes=alternative_language_codes,  # Auto-detect from these
-            enable_automatic_punctuation=True,
-            enable_interim_results=True,
-            enable_word_time_offsets=True,  # Better accuracy tracking
-            enable_word_confidence=True,  # Word-level confidence scores
-            adaptation=adaptation,
-            model="latest_long",  # Best for continuous speech
-            use_enhanced=True,  # Use enhanced model for better accuracy
-            audio_channel_count=1,  # Mono audio
-            enable_separate_recognition_per_channel=False,
-        )
-        
-        streaming_config = speech.StreamingRecognitionConfig(
-            config=config,
-            interim_results=True,
-            single_utterance=False,  # Allow continuous recognition
-        )
-        
-        # Use a queue to collect audio chunks
-        import queue
-        import threading
-        audio_queue = queue.Queue()
-        response_queue = queue.Queue()
-        stream_closed = False
-        
-        async def receive_audio():
-            """Receive audio chunks from WebSocket and add to queue"""
-            try:
-                while True:
-                    data = await websocket.receive_bytes()
-                    if not data:
-                        break
-                    audio_queue.put(data)
-            except WebSocketDisconnect:
-                pass
-            finally:
-                nonlocal stream_closed
-                stream_closed = True
-                audio_queue.put(None)  # Signal end of stream
-        
-        def process_audio_chunk(audio_bytes: bytes) -> bytes:
-            """Apply noise reduction and normalization to audio chunk"""
-            if not NOISE_REDUCE_AVAILABLE:
-                return audio_bytes
+        # Define callback functions for AssemblyAI
+        async def on_transcript(transcript: aai.RealtimeTranscript):
+            """Handle transcript results from AssemblyAI"""
+            if not transcript.text:
+                return
             
             try:
-                # Convert bytes to numpy array (Int16)
-                audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                
-                # Convert to float32 for processing (-1.0 to 1.0 range)
-                audio_float = audio_int16.astype(np.float32) / 32768.0
-                
-                # Apply noise reduction with aggressive settings for voice commands
-                audio_reduced = nr.reduce_noise(
-                    y=audio_float, 
-                    sr=16000, 
-                    stationary=False,
-                    prop_decrease=0.8,  # More aggressive noise reduction
-                    n_fft=2048,  # Better frequency resolution
-                    win_length=2048,
-                    hop_length=512
-                )
-                
-                # Apply high-pass filter to remove low-frequency noise
-                try:
-                    from scipy.signal import butter, filtfilt
-                    nyquist = 16000 / 2
-                    low_cutoff = 80 / nyquist  # Remove frequencies below 80 Hz
-                    b, a = butter(4, low_cutoff, btype='high')
-                    audio_filtered = filtfilt(b, a, audio_reduced)
-                except Exception:
-                    audio_filtered = audio_reduced
-                
-                # Normalize audio (RMS normalization for better consistency)
-                rms = np.sqrt(np.mean(audio_filtered**2))
-                if rms > 0:
-                    target_rms = 0.15  # Slightly higher target for better clarity
-                    audio_normalized = audio_filtered * (target_rms / rms)
-                    # Clip to prevent distortion but allow more dynamic range
-                    audio_normalized = np.clip(audio_normalized, -0.98, 0.98)
-                else:
-                    audio_normalized = audio_filtered
-                
-                # Convert back to Int16
-                audio_processed = (audio_normalized * 32767.0).astype(np.int16)
-                
-                # Convert back to bytes
-                return audio_processed.tobytes()
+                # Send transcript to client
+                await websocket.send_json({
+                    "type": "transcript",
+                    "transcript": transcript.text,
+                    "is_final": isinstance(transcript, aai.RealtimeFinalTranscript),
+                    "confidence": transcript.confidence if hasattr(transcript, 'confidence') else None,
+                    "language_code": "en",  # AssemblyAI defaults to English
+                })
             except Exception as e:
-                print(f"Audio processing error: {e}")
-                return audio_bytes  # Return original if processing fails
+                print(f"Error sending transcript: {e}")
         
-        def audio_generator():
-            """Generator that yields processed audio chunks from queue"""
-            while True:
-                try:
-                    chunk = audio_queue.get(timeout=1)
-                    if chunk is None:  # End of stream signal
-                        break
-                    # Process audio chunk (noise reduction + normalization)
-                    processed_chunk = process_audio_chunk(chunk)
-                    yield speech.StreamingRecognizeRequest(audio_content=processed_chunk)
-                except queue.Empty:
-                    if stream_closed:
-                        break
-                    continue
-        
-        def run_recognition():
-            """Run Google Cloud Speech recognition in a separate thread"""
+        async def on_error(error: aai.RealtimeError):
+            """Handle errors from AssemblyAI"""
             try:
-                responses = client.streaming_recognize(streaming_config, audio_generator())
-                for response in responses:
-                    response_queue.put(response)
+                await websocket.send_json({
+                    "type": "error",
+                    "message": f"Recognition error: {str(error)}"
+                })
             except Exception as e:
-                response_queue.put({"error": str(e)})
-            finally:
-                response_queue.put(None)  # Signal end
+                print(f"Error sending error message: {e}")
         
-        # Start receiving audio in background
-        receive_task = asyncio.create_task(receive_audio())
+        # Set the callback functions
+        transcriber.on_data = on_transcript
+        transcriber.on_error = on_error
         
-        # Start recognition in a separate thread
-        recognition_thread = threading.Thread(target=run_recognition, daemon=True)
-        recognition_thread.start()
+        # Connect to AssemblyAI
+        transcriber.connect()
         
         try:
-            # Process responses from the queue
+            # Receive and forward audio chunks
             while True:
                 try:
-                    response = response_queue.get(timeout=0.5)
-                    if response is None:  # End of stream
+                    # Receive audio chunk from WebSocket
+                    data = await websocket.receive_bytes()
+                    
+                    if not data:
                         break
                     
-                    if isinstance(response, dict) and "error" in response:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Recognition error: {response['error']}"
-                        })
-                        break
+                    # Forward audio directly to AssemblyAI
+                    # No need for complex queuing or threading - the library handles it!
+                    transcriber.stream(data)
                     
-                    if response.error:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Recognition error: {response.error.message}"
-                        })
-                        continue
-                    
-                    for result in response.results:
-                        if not result.alternatives:
-                            continue
-                        
-                        alternative = result.alternatives[0]
-                        transcript = alternative.transcript
-                        confidence = alternative.confidence if hasattr(alternative, 'confidence') else None
-                        
-                        # Extract detected language code from result
-                        # Google Cloud Speech returns language_code in the result if language detection is enabled
-                        detected_language = "en-US"  # Default
-                        if hasattr(result, 'language_code') and result.language_code:
-                            detected_language = result.language_code
-                        elif hasattr(alternative, 'language_code') and alternative.language_code:
-                            detected_language = alternative.language_code
-                        
-                        # Convert language code to our format (e.g., "en-US" -> "en", "hi-IN" -> "hi")
-                        lang_code = detected_language.split("-")[0].lower()
-                        
-                        # Send transcript to client with detected language
-                        await websocket.send_json({
-                            "type": "transcript",
-                            "transcript": transcript,
-                            "is_final": result.is_final_alternative,
-                            "confidence": confidence,
-                            "language_code": lang_code,  # Add detected language
-                            "language_full": detected_language,  # Full language code
-                        })
-                except queue.Empty:
-                    # Check if recognition thread is still alive
-                    if not recognition_thread.is_alive():
-                        break
-                    continue
+                except WebSocketDisconnect:
+                    break
+                except Exception as e:
+                    print(f"Error receiving audio: {e}")
+                    break
         
         except Exception as e:
             await websocket.send_json({
@@ -1169,11 +1008,9 @@ async def websocket_voice(websocket: WebSocket):
                 "message": f"Streaming error: {str(e)}"
             })
         finally:
-            receive_task.cancel()
-            try:
-                await receive_task
-            except asyncio.CancelledError:
-                pass
+            # Close the transcriber connection
+            if transcriber:
+                transcriber.close()
     
     except WebSocketDisconnect:
         pass
