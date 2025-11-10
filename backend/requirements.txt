@@ -16,3 +16,17 @@ google-cloud-speech==2.21.0
 noisereduce>=3.0.0
 scipy>=1.10.0
 assemblyai>=0.17.0
+# For enhanced preprocessing and ensemble (optional for accuracy improvements)
+# Uncomment these after ensuring compatibility with your Python version:
+# Pillow>=10.0.0
+# joblib>=1.3.0
+
+# Optional: For MediaPipe model (may not work on all platforms)
+# mediapipe>=0.10.0
+
+# Optional: For ViT model (requires significant disk space ~2GB)
+# torch>=2.0.0
+# transformers>=4.30.0
+
+# Note: The server will work without these, but accuracy improvements won't be available
+# Install what works on your system: pip install Pillow joblib
